@@ -5,15 +5,17 @@ VMs. No k3s, no kind, no pre-baked images — plain `kubeadm init` /
 `kubeadm join` / certs on real VMs, the same path a production on-prem
 or bare-metal cluster would take.
 
-**`clusters.yaml` is the single source of truth.** Every cluster you want
-declares, by name, exactly which nodes should exist and how they're
-sized — not a node *count* that gets recomputed from Makefile variables
-each run (that recomputation is exactly what causes silent drift: run
-`make destroy` with different variables than what created the cluster,
-and it computes a different — wrong — node list). `provision.py` reads
-that file, compares it against what Multipass actually has running, and
-converges one towards the other — the same desired-state-vs-actual-state
-model Kubernetes controllers use.
+**`clusters.yaml` is the single source of truth, and `provision.py` is the
+only thing that acts on it.** There's no Makefile, no wrapper script —
+every operation is `python3 provision.py <command> --cluster <name>`.
+Each cluster declares, by name, exactly which nodes should exist and how
+they're sized — not a node *count* that gets recomputed on every run
+(recomputing from a count is exactly what causes silent drift: change the
+count between runs and it computes a different — wrong — node list, with
+nothing left over to tell you so). `provision.py` reads `clusters.yaml`,
+compares it against what Multipass actually has running, and converges
+one towards the other — the same desired-state-vs-actual-state model
+Kubernetes controllers use.
 
 A cluster with one control plane and no `vip:` block is a plain single-CP
 cluster. A cluster with `vip.enabled: true` and more than one entry under
@@ -32,25 +34,27 @@ through the exact same code path — nothing is duplicated.
 ## Quick start
 
 ```bash
-make up CLUSTER=quick-test      # single control-plane, per the example clusters.yaml
-make status CLUSTER=quick-test
-make audit CLUSTER=quick-test   # read-only — drift and orphan report, no side effects
-make destroy CLUSTER=quick-test
+python3 provision.py up --cluster quick-test        # single control-plane, per the example clusters.yaml
+python3 provision.py status --cluster quick-test
+python3 provision.py audit --cluster quick-test      # read-only — drift and orphan report, no side effects
+python3 provision.py destroy --cluster quick-test
 ```
 
 ```bash
-make up CLUSTER=cka-lab         # HA, 3 control planes, per the example clusters.yaml
+python3 provision.py up --cluster cka-lab            # HA, 3 control planes, per the example clusters.yaml
 ```
 
-`make up` is idempotent — re-run it after a partial failure and it skips
-VMs that already exist, starts any that are `Stopped`, skips bootstrap
-steps already done, and regenerates join tokens either way (cheap, avoids
-24h/2h expiry surprises). `make audit CLUSTER=<name>` never modifies
-anything — it just reports where reality has drifted from `clusters.yaml`
-(missing nodes, stopped nodes, CPU/memory/disk that doesn't match, and
-orphaned VMs that exist but aren't declared). `--prune` (as
-`PRUNE=1` on `make up`/`make destroy`) is the only thing that removes an
-orphan, and it's never automatic.
+`--config` defaults to `clusters.yaml` in the repo root — pass
+`--config path/to/other.yaml` to use a different file.
+
+`up` is idempotent — re-run it after a partial failure and it skips VMs
+that already exist, starts any that are `Stopped`, skips bootstrap steps
+already done, and regenerates join tokens either way (cheap, avoids
+24h/2h expiry surprises). `audit` never modifies anything — it just
+reports where reality has drifted from `clusters.yaml` (missing nodes,
+stopped nodes, CPU/memory/disk that doesn't match, and orphaned VMs that
+exist but aren't declared). `--prune` (on `up`/`destroy`) is the only
+thing that removes an orphan, and it's never automatic.
 
 ## `clusters.yaml`
 
@@ -165,7 +169,6 @@ What each command does with that diff:
 kubeadm-multipass-lab/
 ├── clusters.yaml           # declared state for every cluster
 ├── provision.py             # idempotent reconciler — reads clusters.yaml, drives multipass
-├── Makefile                  # thin wrapper: make {up,destroy,status,audit} CLUSTER=<name>
 ├── scripts/
 │   ├── common-setup.sh      # runs on every node
 │   ├── write-kube-vip.sh    # runs on control-plane nodes, before init/join (HA only)
@@ -180,7 +183,7 @@ Add an entry under `workers:` (or `control_planes:`) in `clusters.yaml`
 — any size you want, independent of that cluster's `defaults` — then:
 
 ```bash
-make up CLUSTER=cka-lab
+python3 provision.py up --cluster cka-lab
 ```
 
 `provision.py` diffs the file against what's actually running and only
@@ -194,9 +197,10 @@ worker.
 ## Other commands
 
 ```bash
-make status CLUSTER=<name>
-multipass shell <node-name>     # shell into any node directly
-make destroy            # tear everything down, including add-worker nodes
+python3 provision.py status --cluster <name>
+multipass shell <node-name>                     # shell into any node directly
+python3 provision.py destroy --cluster <name>   # tear down every node declared for that cluster
+python3 provision.py destroy --cluster <name> --prune   # + delete undeclared/orphaned VMs for it
 ```
 
 ## Why kube-vip instead of HAProxy+keepalived (HA mode)
