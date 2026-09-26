@@ -52,9 +52,112 @@ orphaned VMs that exist but aren't declared). `--prune` (as
 `PRUNE=1` on `make up`/`make destroy`) is the only thing that removes an
 orphan, and it's never automatic.
 
-See `clusters.yaml` for the full schema — `vip`, `cni`, `addons`,
-per-node `cpus`/`memory`/`disk` overrides on top of a cluster-wide
-`defaults` block.
+## `clusters.yaml`
+
+Everything lives under a top-level `clusters:` map, keyed by cluster name.
+Each cluster is a full declaration of what should exist — nothing is
+derived from a count:
+
+```yaml
+clusters:
+  cka-lab:
+    image: "24.04"          # Multipass image alias
+    k8s_stream: v1.35        # passed to common-setup.sh, picks the k8s apt/pkg stream
+
+    vip:                      # omit this whole block for a single-CP cluster
+      enabled: true
+      address: auto           # "auto" pings .200-.210 on the first CP's subnet and
+                                # caches the pick in .state/<cluster>/vip; or pin an IP
+      provider: kube-vip       # only value supported right now
+      version: v1.2.1
+
+    cni:
+      type: calico             # only value supported right now
+      version: v3.32.1
+      pod_cidr: 10.244.0.0/16
+
+    addons:                    # optional, see ADDON_INSTALLERS below
+      - name: metrics-server
+        enabled: true
+
+    defaults:                  # applied to every node below unless overridden
+      cpus: 2
+      memory: 2G
+      disk: 20G
+
+    control_planes:            # >= 1 required; >1 only takes effect with vip.enabled
+      - name: cka-cp1
+      - name: cka-cp2
+      - name: cka-cp3
+
+    workers:
+      - name: cka-w1
+      - name: cka-w2
+      - name: cka-w3
+        memory: 4G            # per-node override — everything else still inherits defaults
+```
+
+Rules `provision.py` enforces when it loads this file (`load_clusters()`):
+
+- **Node names must be unique across the entire file**, not just within
+  one cluster. This is a real limitation, not an oversight — Multipass has
+  no per-cluster namespace on a single host, so `cka-w1` and `quick-test`'s
+  own `w1` would collide as the same VM. Pick distinct prefixes per
+  cluster (`cka-*`, `qt-*`, ...).
+- Every cluster needs at least one entry under `control_planes`.
+- `vip.provider` only accepts `kube-vip` and `cni.type` only accepts
+  `calico` today — anything else fails fast at load time rather than
+  half-provisioning something unsupported.
+- A node's `cpus`/`memory`/`disk` fall back to that cluster's `defaults`
+  block (itself defaulting to `2` / `2G` / `20G`) — set only what you want
+  to override, per node.
+- `addons` is just a list of `{name, enabled}`; `install_addons()` looks
+  each enabled name up in a small built-in dict, `ADDON_INSTALLERS`, and
+  runs its kubectl one-liner on the first control plane. Right now only
+  `metrics-server` has an installer — `ingress-nginx` in the `quick-test`
+  example will print a skip-warning until one's added.
+
+## How `provision.py` reconciles state
+
+Every command starts the same way: `load_clusters()` parses `clusters.yaml`
+into `ClusterConfig`/`NodeSpec` objects, then `mp_list()` (`multipass list
+--format=json`) is asked what actually exists. `compute_diff()` compares
+the two and produces three lists:
+
+- **`to_create`** — declared nodes with no matching Multipass VM at all.
+- **`to_start`** — declared nodes that exist but aren't `Running`.
+- **`orphans`** — VMs that exist and *look like* they belong to this
+  cluster (a name-prefix heuristic in `_looks_like_ours()`, since
+  Multipass doesn't tag VMs by cluster) but aren't declared anywhere in
+  `clusters.yaml` for it.
+
+What each command does with that diff:
+
+- **`up`** — launches everything in `to_create`, starts everything in
+  `to_start` (deleting orphans first if `--prune` is set), then always
+  runs the full bootstrap pipeline in order: `bootstrap_node()` (transfers
+  and runs `common-setup.sh` on every node), `detect_or_read_vip()` (only
+  if `vip.enabled`), `init_first_cp()` (kubeadm init on the first control
+  plane — skipped if `/etc/kubernetes/admin.conf` already exists via
+  `cp_is_initialized()`), `join_control_planes()` and `join_workers()`
+  (each skipped per-node via `node_has_joined()` checking
+  `/etc/kubernetes/kubelet.conf`), `install_cni()`, then
+  `install_addons()`. Every step is independently idempotent, so a
+  half-failed `up` can just be re-run — join tokens/certificate keys are
+  regenerated every time regardless (cheap, and avoids the 24h/2h expiry
+  windows).
+- **`destroy`** — deletes every node declared for that cluster (skipping
+  ones already gone), deletes orphans too if `--prune`, then removes that
+  cluster's `.state/<name>/` directory (cached VIP, staged join scripts).
+- **`status`** — read-only: prints each declared node's Multipass state
+  and whether it's joined the cluster.
+- **`audit`** (`-a`) — fully read-only, makes no Multipass calls that
+  change anything. For each declared node it prints declared vs. actual
+  `cpus`/`memory`/`disk` (parsed and compared with a 5% tolerance via
+  `_sizes_match()`, since Multipass can round what you asked for) and
+  flags stopped nodes, then lists orphans separately. Exits `1` if
+  anything drifted, `0` if everything matches — usable in a script or CI
+  check.
 
 ## Layout
 
@@ -121,13 +224,13 @@ it does not also handle `Service type=LoadBalancer` traffic.
 # find who currently holds the VIP
 kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}'; echo
 
-multipass stop k8s-cp1   # or whichever node currently holds the VIP
+multipass stop cka-cp1   # or whichever node currently holds the VIP
 
 # from your host
 ping <VIP>                              # keeps answering, reassigned to a survivor
 kubectl get nodes                       # the stopped node -> NotReady after ~40s
 
-kubectl -n kube-system exec etcd-k8s-cp2 -- etcdctl \
+kubectl -n kube-system exec etcd-cka-cp2 -- etcdctl \
   --endpoints=https://127.0.0.1:2379 \
   --cacert=/etc/kubernetes/pki/etcd/ca.crt \
   --cert=/etc/kubernetes/pki/etcd/server.crt \
@@ -136,7 +239,7 @@ kubectl -n kube-system exec etcd-k8s-cp2 -- etcdctl \
 # run this against a SURVIVING node — kubectl exec proxies through that
 # node's kubelet, so exec'ing into the stopped node's etcd pod will fail
 
-multipass start k8s-cp1
+multipass start cka-cp1
 ```
 
 etcd tolerates 1 of N members down without losing quorum (needs a
