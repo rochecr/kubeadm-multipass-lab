@@ -1,103 +1,98 @@
 # kubeadm-multipass-lab
 
 Real `kubeadm` Kubernetes clusters on [Multipass](https://multipass.run/)
-VMs, one `make up` away. No k3s, no kind, no pre-baked images — plain
-`kubeadm init` / `kubeadm join` / certs on real VMs, the same path a
-production on-prem or bare-metal cluster would take.
+VMs. No k3s, no kind, no pre-baked images — plain `kubeadm init` /
+`kubeadm join` / certs on real VMs, the same path a production on-prem
+or bare-metal cluster would take.
 
-One Makefile, two shapes, controlled by a single variable:
+**`clusters.yaml` is the single source of truth.** Every cluster you want
+declares, by name, exactly which nodes should exist and how they're
+sized — not a node *count* that gets recomputed from Makefile variables
+each run (that recomputation is exactly what causes silent drift: run
+`make destroy` with different variables than what created the cluster,
+and it computes a different — wrong — node list). `provision.py` reads
+that file, compares it against what Multipass actually has running, and
+converges one towards the other — the same desired-state-vs-actual-state
+model Kubernetes controllers use.
 
-- **`CP_COUNT=1`** (default) — a single control-plane node, no VIP, no
-  load balancer. The simplest possible real cluster, good for anything
-  that doesn't care about control-plane HA: trying out a CRD, a Helm
-  chart, an admission webhook, a CNI feature, generic workload testing.
-- **`CP_COUNT>1`** — a highly-available control plane, stacked etcd,
-  fronted by [kube-vip](https://kube-vip.io/) (ARP mode) providing a
-  floating VIP across however many control-plane nodes you ask for. Good
-  for anything that specifically needs to exercise HA behavior: control-plane
-  failover, etcd quorum loss, testing tooling against a realistic
-  multi-master topology.
-
-Both shapes share the exact same scripts and Makefile targets — nothing
-is duplicated between them.
+A cluster with one control plane and no `vip:` block is a plain single-CP
+cluster. A cluster with `vip.enabled: true` and more than one entry under
+`control_planes` gets a highly-available control plane, stacked etcd,
+fronted by [kube-vip](https://kube-vip.io/) (ARP mode). Both shapes run
+through the exact same code path — nothing is duplicated.
 
 ## Prerequisites
 
 - [Multipass](https://multipass.run/) installed and working
   (`multipass launch ...` should already work before you touch this repo)
-- `kubectl` (for `make verify` and general cluster interaction)
-- Enough host resources for however many VMs you ask for — each defaults
-  to 2 vCPU / 2GB RAM / 20GB disk (`CPUS`/`MEM`/`DISK`, overridable)
+- Python 3.9+ with PyYAML: `pip install pyyaml`
+- `kubectl` (for cluster interaction once it's up)
+- Enough host resources for however many VMs your cluster declares
 
 ## Quick start
 
-Simple, single control-plane:
-
 ```bash
-make up                          # 1 control plane + 2 workers, no VIP
-make kubeconfig
-export KUBECONFIG=$PWD/kubeconfig
-make verify
-make destroy
+make up CLUSTER=quick-test      # single control-plane, per the example clusters.yaml
+make status CLUSTER=quick-test
+make audit CLUSTER=quick-test   # read-only — drift and orphan report, no side effects
+make destroy CLUSTER=quick-test
 ```
 
-HA, three control planes:
-
 ```bash
-make up CP_COUNT=3 WORKER_COUNT=2
-make kubeconfig
-export KUBECONFIG=$PWD/kubeconfig
-make verify
-make destroy
+make up CLUSTER=cka-lab         # HA, 3 control planes, per the example clusters.yaml
 ```
-
-Every value is overridable — `CP_COUNT`, `WORKER_COUNT`, `NAME_PREFIX`,
-`CPUS`, `MEM`, `DISK`, `K8S_STREAM`, `POD_CIDR`, `CALICO_VERSION`,
-`KUBE_VIP_VERSION`, `VIP`. `make help` prints the current effective
-config and a couple of examples.
 
 `make up` is idempotent — re-run it after a partial failure and it skips
-VMs that already exist, nodes already bootstrapped, a first control
-plane already initialized, and any control plane/worker already joined.
-In HA mode it also auto-picks a free VIP from the first control plane's
-subnet the first time it runs and caches it in `.state/vip` — override
-with `make up VIP=192.168.64.200` if the auto-pick collides with
-something else on your LAN.
+VMs that already exist, starts any that are `Stopped`, skips bootstrap
+steps already done, and regenerates join tokens either way (cheap, avoids
+24h/2h expiry surprises). `make audit CLUSTER=<name>` never modifies
+anything — it just reports where reality has drifted from `clusters.yaml`
+(missing nodes, stopped nodes, CPU/memory/disk that doesn't match, and
+orphaned VMs that exist but aren't declared). `--prune` (as
+`PRUNE=1` on `make up`/`make destroy`) is the only thing that removes an
+orphan, and it's never automatic.
+
+See `clusters.yaml` for the full schema — `vip`, `cni`, `addons`,
+per-node `cpus`/`memory`/`disk` overrides on top of a cluster-wide
+`defaults` block.
 
 ## Layout
 
 ```
 kubeadm-multipass-lab/
-├── Makefile
+├── clusters.yaml           # declared state for every cluster
+├── provision.py             # idempotent reconciler — reads clusters.yaml, drives multipass
+├── Makefile                  # thin wrapper: make {up,destroy,status,audit} CLUSTER=<name>
 ├── scripts/
-│   ├── common-setup.sh     # runs on every node
-│   ├── write-kube-vip.sh   # runs on control-plane nodes, before init/join (HA only)
-│   ├── init-first-cp.sh    # runs on the first control-plane node only
-│   └── install-calico.sh   # runs on the first control-plane node only
-├── verify.sh
-└── .state/                  # gitignored: VIP + join command staging
+│   ├── common-setup.sh      # runs on every node
+│   ├── write-kube-vip.sh    # runs on control-plane nodes, before init/join (HA only)
+│   ├── init-first-cp.sh     # runs on the first control-plane node only
+│   └── install-calico.sh    # runs on the first control-plane node only
+└── .state/<cluster-name>/    # gitignored: per-cluster VIP + join command staging
 ```
 
 ## Adding a node later
 
-Works the same in either mode — add a worker of any size, independent
-of the fleet's default sizing:
+Add an entry under `workers:` (or `control_planes:`) in `clusters.yaml`
+— any size you want, independent of that cluster's `defaults` — then:
 
 ```bash
-make add-worker NAME=k8s-w3 ADD_MEM=4G
+make up CLUSTER=cka-lab
 ```
 
-Idempotent, tracked in `.state/extra-nodes` so `make destroy` tears it
-down too. `kubeadm` never auto-labels worker nodes with a role (only
-control-plane nodes get one automatically) — `add-worker` sets
-`node-role.kubernetes.io/worker=` for you so `kubectl get nodes` doesn't
-show `ROLES=<none>`.
+`provision.py` diffs the file against what's actually running and only
+creates/bootstraps/joins the new node; everything already converged is
+left alone. It also labels new workers with
+`node-role.kubernetes.io/worker=` automatically — `kubeadm` never does
+this itself (only control-plane nodes get an automatic role label), so
+without it `kubectl get nodes` would show `ROLES=<none>` for every
+worker.
 
-## Other targets
+## Other commands
 
 ```bash
-make status             # multipass list
-make ssh NAME=k8s-cp1   # shell into any node
+make status CLUSTER=<name>
+multipass shell <node-name>     # shell into any node directly
 make destroy            # tear everything down, including add-worker nodes
 ```
 

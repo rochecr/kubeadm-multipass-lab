@@ -1,3 +1,5 @@
 .state/
 kubeconfig
 *.db
+__pycache__/
+*.pyc

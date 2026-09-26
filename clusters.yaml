@@ -1,0 +1,76 @@
+# clusters.yaml — fuente de verdad. Cada cluster declara EXACTAMENTE qué
+# nodos deben existir, no una cantidad que se recalcula cada vez.
+#
+# Uso:
+#   python3 provision.py up      --cluster cka-lab
+#   python3 provision.py audit   --cluster cka-lab   # solo lectura, no modifica nada
+#   python3 provision.py status  --cluster cka-lab
+#   python3 provision.py destroy --cluster cka-lab
+#
+# Los nombres de nodo deben ser únicos en TODO el archivo, no solo dentro
+# de un cluster — es una limitación de Multipass en un solo host, no del
+# formato en sí.
+clusters:
+
+  cka-lab:
+    image: "24.04"
+    k8s_stream: v1.35
+
+    vip:
+      enabled: true
+      address: auto        # o una IP fija, ej. "10.81.58.200"
+      provider: kube-vip
+      version: v1.2.1
+
+    cni:
+      type: calico
+      version: v3.32.1
+      pod_cidr: 10.244.0.0/16
+
+    addons:
+      - name: metrics-server
+        enabled: true
+
+    defaults:
+      cpus: 2
+      memory: 2G
+      disk: 20G
+
+    control_planes:
+      - name: cka-cp1
+      - name: cka-cp2
+      - name: cka-cp3
+
+    workers:
+      - name: cka-w1
+      - name: cka-w2
+      - name: cka-w3
+        memory: 4G          # override puntual — el resto hereda de defaults
+
+  quick-test:
+    image: "24.04"
+    k8s_stream: v1.34
+    # sin bloque vip: -> single control-plane, sin kube-vip
+
+    cni:
+      type: calico
+      version: v3.32.1
+      pod_cidr: 10.244.0.0/16
+
+    addons:
+      - name: ingress-nginx
+        enabled: true
+      - name: metrics-server
+        enabled: true
+
+    defaults:
+      cpus: 2
+      memory: 2G
+      disk: 20G
+
+    control_planes:
+      - name: qt-cp1
+
+    workers:
+      - name: qt-w1
+      - name: qt-w2
