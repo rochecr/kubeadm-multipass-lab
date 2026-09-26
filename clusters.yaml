@@ -94,9 +94,9 @@ clusters:
       disk: 20G
 
     control_planes:
-      - name: cka-cp1  
+      - name: ckas-cp1  
 
     workers:
-      - name: cka-w1
-      - name: cka-w2      
+      - name: ckas-w1
+      - name: ckas-w2      
         memory: 4G      
