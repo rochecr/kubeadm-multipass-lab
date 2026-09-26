@@ -74,3 +74,29 @@ clusters:
     workers:
       - name: qt-w1
       - name: qt-w2
+
+  cka-lab-small:
+    image: "24.04"
+    k8s_stream: v1.35
+
+    cni:
+      type: calico
+      version: v3.32.1
+      pod_cidr: 10.244.0.0/16
+
+    addons:
+      - name: metrics-server
+        enabled: true
+
+    defaults:
+      cpus: 2
+      memory: 2G
+      disk: 20G
+
+    control_planes:
+      - name: cka-cp1  
+
+    workers:
+      - name: cka-w1
+      - name: cka-w2      
+        memory: 4G      
